@@ -203,6 +203,18 @@ public class Snappy
     }
 
     /**
+     * Compress the input int array with bit-shuffling
+     *
+     * @param input
+     * @return the compressed data
+     */
+    public static byte[] compressWithBitShuffle(int[] input)
+            throws IOException
+    {
+        return rawCompressWithBitShuffle(input, input.length * 4, 4); // int uses 4 bytes
+    }
+
+    /**
      * Compress the input long array
      *
      * @param input
@@ -224,6 +236,77 @@ public class Snappy
             throws IOException
     {
         return rawCompress(input, input.length * 2); // short uses 2 bytes
+    }
+
+    /**
+     * Buffer block size for bit-shuffling.
+     * We bit-transpose a small block of data that fits comfortably into
+     * the L1d/L2 memory cache and then apply the Snappy compressor
+     * while it is still in cache because getting the memory contents in and out
+     * of the cache can be the bottleneck.
+     */
+    private static final int BUFSIZE_IN_BYTE_FOR_BITSHUFFLE = 8192;
+
+    /**
+     * Compress the input data and produce a byte array of the uncompressed data.
+     * Before compression, a filter, called BitShuffle, is applied into the input
+     * data and the filter improves compression of typed binary data.
+     *
+     * @param data input array. The input MUST be an array type
+     * @param byteSize the input byte size
+     * @return compressed data
+     */
+    private static byte[] rawCompressWithBitShuffle(Object data, int byteSize, int typeSize)
+            throws IOException
+    {
+        ByteBuffer buf = ByteBuffer.allocate(maxCompressedLengthWithBitShuffle(byteSize));
+        byte[] byteArray = buf.array();
+        byte[] bitShuffleBuf = new byte[BUFSIZE_IN_BYTE_FOR_BITSHUFFLE];
+        int numBlocks = getNumBitShuffleBlocks(byteSize);
+        for (int i = 0; i < numBlocks; i++) {
+            int byteToCompress;
+            if ((i + 1) * BUFSIZE_IN_BYTE_FOR_BITSHUFFLE <= byteSize) {
+                byteToCompress = BUFSIZE_IN_BYTE_FOR_BITSHUFFLE;
+            } else {
+                byteToCompress = getMultipleOf8(byteSize % BUFSIZE_IN_BYTE_FOR_BITSHUFFLE);
+            }
+            int returnCode = SnappyLoader.loadBitShuffleApi().bitShuffle(
+                    data, i * BUFSIZE_IN_BYTE_FOR_BITSHUFFLE, typeSize, byteToCompress, bitShuffleBuf, 0);
+            assert(returnCode == byteToCompress);
+            int compressedByteSize = impl.rawCompress(
+                    bitShuffleBuf, 0, byteToCompress, byteArray, 4 + buf.position());
+            buf.putInt(compressedByteSize);
+            buf.position(compressedByteSize + buf.position());
+        }
+        byte[] result = new byte[buf.position()];
+        System.arraycopy(byteArray, 0, result, 0, buf.position());
+        return result;
+    }
+
+    /**
+     * Compute the possible maximum size for [[rawCompressWithBitShuffle]].
+     */
+    private static int maxCompressedLengthWithBitShuffle(int byteSize) {
+        int numFilledBlocks = byteSize / BUFSIZE_IN_BYTE_FOR_BITSHUFFLE;
+        int rem = byteSize % BUFSIZE_IN_BYTE_FOR_BITSHUFFLE;
+        int sizeInByte = numFilledBlocks * Snappy.maxCompressedLength(BUFSIZE_IN_BYTE_FOR_BITSHUFFLE);
+        sizeInByte += Snappy.maxCompressedLength(getMultipleOf8(rem));
+        sizeInByte += 4 * (numFilledBlocks + ((rem > 0)? 1 : 0));
+        return sizeInByte;
+    }
+
+    /**
+     * Compute the necessary number of bit-shuffling blocks.
+     */
+    private static int getNumBitShuffleBlocks(int size) {
+        return (size + BUFSIZE_IN_BYTE_FOR_BITSHUFFLE - 1) / BUFSIZE_IN_BYTE_FOR_BITSHUFFLE;
+    }
+
+    /**
+     * Makes an input value a multiple 8 for the restriction of the bit-shuffling library.
+     */
+    private static int getMultipleOf8(int value) {
+        return ((value + 7) / 8) * 8;
     }
 
     /**
